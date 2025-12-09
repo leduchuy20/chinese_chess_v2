@@ -1,0 +1,7 @@
+numpy
+keras-nightly
+torch
+keras
+opencv-python
+tensorflow
+pymysql
