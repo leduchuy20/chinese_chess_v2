@@ -1,6 +1,7 @@
 numpy
 keras-nightly
 torch
+ultralytics
 keras
 opencv-python
 tensorflow

@@ -3,8 +3,8 @@
 import AdjustCameraLocation as ad
 import cv2, os, operator
 import numpy as np
-import onnxruntime as ort   # <- dùng ONNXRuntime
 import torch
+from piece_detector import PieceDetector
 
 ip = ad.ip
 pieceTypeList = ['b_jiang','b_ju', 'b_ma', 'b_pao', 'b_shi', 'b_xiang', 'b_zu',
@@ -19,21 +19,13 @@ isRed = True
 
 def initialization():
     global GRID_WIDTH_HORI, GRID_WIDTH_VERTI, begin_point, cap, db, cursor
-    global step, legal_move, model, target_size, isRed, input_name  # thêm input_name
+    global step, legal_move, model, target_size, isRed
 
     step = 0           # For recording steps
     legal_move = True  # To decide if the move is legal or illegal
     isRed = True       # To decide which team moves now
-    target_size = (56, 56)  # CNN input image size
-
-    # ---------------- ONNX model ----------------
-    # Đổi đường dẫn dưới đây thành file .onnx của bạn
-    model = ort.InferenceSession(
-        "./chinese_chess_model_int8.onnx",   # ví dụ: đường dẫn model ONNX
-        providers=["CPUExecutionProvider"]
-    )
-    input_name = model.get_inputs()[0].name
-    # -------------------------------------------
+    target_size = (640, 640)
+    model = PieceDetector(weights_path='./weights.pt', imgsz=640, conf=0.25)
 
     # Initialize grid width (giữ nguyên phần này)
     frame0 = cv2.imread('./Test_Image/Step 0.png', 0)
@@ -55,22 +47,7 @@ def initialization():
 
 
 def piece_prediction(model, img, target_size, top_n=3):
-    # Chuẩn hoá ảnh giống như lúc training
-    x = cv2.resize(img, target_size)
-    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
-    x = x.astype('float32') / 255.0
-    x = np.expand_dims(x, axis=0)  # shape (1, 56, 56, 3) nếu training kiểu channels_last
-
-    # Nếu model ONNX của bạn dùng channels_first (NCHW),
-    # thì cần đổi lại:
-    # x = np.transpose(x, (0, 3, 1, 2))  # (1, 3, 56, 56)
-
-    # Chạy ONNX
-    global input_name
-    preds = model.run(None, {input_name: x})[0]  # preds shape: (1, num_classes)
-
-    idx = int(np.argmax(preds, axis=1)[0])
-    return label_type[idx]
+    return model.predict_piece(img, default_label='grid')
 
 
 def save_path(beginPoint, endPoint, piece):

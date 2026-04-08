@@ -8,6 +8,8 @@ To solve this problem, the first step is to identify the beginning point and the
 
 ## <span style="color:blue">Usage</span>
 - [CNN_Classification_Model](./CNN_Classification_Model) contains the codes I used to train the classification model, it is ok to use the .h5 model named [new_model_v2.h5](./h5_file/new_model_v2.h5) in the h5_file.
+- To run with your Roboflow model, put [weights.pt](./weights.pt) in project root and install dependencies in [requirements.txt](./requirements.txt) (includes `ultralytics`).
+- Main scripts [real_time_test.py](./real_time_test.py), [demo.py](./demo.py), [demo2.py](./demo2.py), and [demo3.py](./demo3.py) are updated to load `./weights.pt` (YOLO, `imgsz=640`).
 - [Dataset](./Dataset) contains the dataset I made by taking pictures by Phone and using HoughCircle to roughly extract some chess pieces from the picture.
 - The [.h5 file model](./h5_file/new_model_v2.h5) works for those images in the Dataset with nearly 100% accuracy, if it is used to detect other kinds of test image with different light intensity or different size, the accuracy may get lower.
 - [Temporary_Model](./Temporary_Model) and [Test_Image](./Test_Image) are two necessary directory used in the codes.

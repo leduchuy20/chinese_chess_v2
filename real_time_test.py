@@ -2,10 +2,21 @@
 import AdjustCameraLocation as ad
 import cv2, os, pymysql, operator, copy
 import numpy as np
-# from keras.models import load_model
-from tensorflow.keras.models import load_model
+import time
+from piece_detector import PieceDetector
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+ENFORCE_MOVE_RULES = True
+MOVE_CAPTURE_DIR = './Move_Captures'
+STABLE_DIFF_THRESHOLD = 1300
+STABLE_SECONDS_REQUIRED = 0.3
+STEP0_STABLE_DIFF_THRESHOLD = 1800
+STEP0_STABLE_SECONDS_REQUIRED = 2.0
+PROCESS_SIZE = 480
+ROI_MOVE_STEP = 12
+ROI_SIZE_STEP = 20
+MOTION_BINARY_THRESHOLD = 15
+DETECT_DURING_MOTION_EVERY = 4
 
 
 ip = ad.ip
@@ -17,6 +28,23 @@ label_type = pieceTypeList_with_grid
 dic = {'b_jiang':'Black King', 'b_ju':'Black Rook', 'b_ma':'Black Knight', 'b_pao':'Black Cannon', 'b_shi':'Black Guard', 'b_xiang':'Black Elephant', 'b_zu':'Black Pawn',
         'r_bing':'Red Soldier', 'r_ju':'Red Chariot', 'r_ma':'Red Horse', 'r_pao':'Red Cannon', 'r_shi':'Red Adviser', 'r_shuai':'Red General', 'r_xiang':'Red Minister'}
 
+board_state_map = {}
+
+
+def normalize_roi(x, y, side, frame_w, frame_h):
+    side = int(max(200, min(side, min(frame_w, frame_h))))
+    x = int(max(0, min(x, frame_w - side)))
+    y = int(max(0, min(y, frame_h - side)))
+    return x, y, side
+
+
+def extract_process_frame(frame, roi):
+    x, y, side = roi
+    patch = frame[y:y + side, x:x + side]
+    if patch.size == 0:
+        return None
+    return cv2.resize(patch, (PROCESS_SIZE, PROCESS_SIZE), interpolation=cv2.INTER_AREA)
+
 
 def Initialization():
     global GRID_WIDTH_HORI, GRID_WIDTH_VERTI, begin_point, cap, db, cursor, step, legal_move, model, target_size, isRed
@@ -24,8 +52,13 @@ def Initialization():
     step = 0		# For recording steps
     legal_move = True	# To decide if the move is legal or illegal
     isRed = True		# To decide which team moves now
-    target_size = (56, 56)		# CNN input image size
-    model = load_model('./h5_file/new_model_v2.h5')	# Machine Learning Model
+    target_size = (640, 640)
+    model = PieceDetector(weights_path='./weights.pt', imgsz=640, conf=0.05)
+    os.makedirs(MOVE_CAPTURE_DIR, exist_ok=True)
+    for name in os.listdir(MOVE_CAPTURE_DIR):
+        path = os.path.join(MOVE_CAPTURE_DIR, name)
+        if os.path.isfile(path):
+            os.remove(path)
 
     # Initialize mysql
     # db = pymysql.connect("localhost", "root", "root", "chess")
@@ -46,6 +79,7 @@ def Initialization():
     end_point = img_circle[np.sum(img_circle, axis=1).tolist().index(max(np.sum(img_circle, axis=1).tolist()))]
     GRID_WIDTH_HORI = (end_point[0] - begin_point[0])/8
     GRID_WIDTH_VERTI = (end_point[1] - begin_point[1])/9
+    init_board_state('./Test_Image/Step 0.png')
     print('Recognition Initialized.\n')
 
 # def PiecePrediction(model, img, target_size, top_n=3):
@@ -55,8 +89,6 @@ def Initialization():
 # 	x = np.expand_dims(x, axis=0)
 # 	preds = model.predict_classes(x)
 # 	return label_type[int(preds)]
-
-import numpy as np  # nhớ đảm bảo có dòng này ở đầu file
 
 # def PiecePrediction(model, piece, target_size):
 #     img = cv2.resize(piece, target_size)
@@ -88,31 +120,117 @@ import numpy as np  # nhớ đảm bảo có dòng này ở đầu file
 #     return label_type[idx]
 
 def PiecePrediction(model, img, target_size, top_n=3):
-    x = cv2.resize(img, target_size)
-    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
-    x = x.astype('float32') / 255.0
-    x = np.expand_dims(x, axis=0)
+    return model.predict_piece(img, default_label='grid')
 
-    # Tắt progress bar
-    preds = model.predict(x, verbose=0)
 
-    idx = int(np.argmax(preds, axis=1)[0])
-    return label_type[idx]
+def crop_with_margin(img, circle, margin_scale=1.6):
+    cx, cy, r = int(circle[0]), int(circle[1]), int(circle[2])
+    m = max(2, int(r * margin_scale))
+    h_img, w_img = img.shape[:2]
+    x1, x2 = max(0, cx - m), min(w_img, cx + m)
+    y1, y2 = max(0, cy - m), min(h_img, cy + m)
+    return img[y1:y2, x1:x2]
+
+
+def point_to_board_xy(point):
+    bx = int(np.around((point[0] - begin_point[0]) / GRID_WIDTH_HORI))
+    by = int(np.around((point[1] - begin_point[1]) / GRID_WIDTH_VERTI))
+    return bx, by
+
+
+def board_xy_to_pixel(cell):
+    return (
+        int(np.around(begin_point[0] + cell[0] * GRID_WIDTH_HORI)),
+        int(np.around(begin_point[1] + cell[1] * GRID_WIDTH_VERTI)),
+    )
+
+
+def detect_board_map(frame):
+    detections = model.predict_detections(frame, conf=0.08)
+    board_map = {}
+
+    for det in detections:
+        label = det['label']
+        if label == 'grid' or label not in dic:
+            continue
+
+        bx, by = point_to_board_xy((det['cx'], det['cy']))
+        if not (0 <= bx <= 8 and 0 <= by <= 9):
+            continue
+
+        key = (bx, by)
+        score = det['conf']
+        if key not in board_map or score > board_map[key][1]:
+            board_map[key] = (label, score)
+
+    return {k: v[0] for k, v in board_map.items()}
+
+
+def init_board_state(step0_path):
+    global board_state_map
+    board_state_map = {}
+
+    step0_img = cv2.imread(step0_path)
+    if step0_img is None:
+        return
+
+    board_state_map = detect_board_map(step0_img)
+
+
+def save_move_snapshot(frame, step_idx, piece_name, begin, end, legal=True):
+    canvas = frame.copy()
+
+    start_pt = (
+        int(np.around(begin_point[0] + begin[0] * GRID_WIDTH_HORI)),
+        int(np.around(begin_point[1] + begin[1] * GRID_WIDTH_VERTI)),
+    )
+    end_pt = (
+        int(np.around(begin_point[0] + end[0] * GRID_WIDTH_HORI)),
+        int(np.around(begin_point[1] + end[1] * GRID_WIDTH_VERTI)),
+    )
+
+    arrow_color = (0, 255, 0) if legal else (0, 0, 255)
+    cv2.circle(canvas, start_pt, 6, (255, 255, 255), -1)
+    cv2.arrowedLine(canvas, start_pt, end_pt, arrow_color, 3, tipLength=0.25)
+
+    status = 'LEGAL' if legal else 'ILLEGAL'
+    text = f"Step {step_idx + 1}: {piece_name} {begin}->{end} [{status}]"
+
+    cv2.putText(
+        canvas,
+        text,
+        (8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0) if legal else (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    filename = f"step_{step_idx + 1:03d}_{piece_name.replace(' ', '_')}_{status}.png"
+    cv2.imwrite(os.path.join(MOVE_CAPTURE_DIR, filename), canvas)
 
 
 
 
 def savePath(beginPoint, endPoint, piece):
     global legal_move	# For indicating error movement
-    begin = (np.around(abs(beginPoint[0]-begin_point[0])/GRID_WIDTH_HORI), np.around(abs(beginPoint[1]-begin_point[1])/GRID_WIDTH_VERTI))
+    begin = point_to_board_xy(beginPoint)
     #print(beginPoint, endPoint)
     end = begin
-    updown = np.around(abs(beginPoint[1]-endPoint[1])/GRID_WIDTH_VERTI)
-    leftright = np.around(abs(beginPoint[0]-endPoint[0])/GRID_WIDTH_HORI)
+    updown = int(np.around(abs(beginPoint[1]-endPoint[1])/GRID_WIDTH_VERTI))
+    leftright = int(np.around(abs(beginPoint[0]-endPoint[0])/GRID_WIDTH_HORI))
     #print(updown, leftright)
     predict_category = PiecePrediction(model, piece, target_size)
-    variety = predict_category.split('_')[-1]
-    color = predict_category.split('_')[0]
+    if predict_category == 'grid':
+        predict_category = board_state_map.get(begin, 'grid')
+
+    if predict_category == 'grid':
+        variety = 'unknown'
+        color = 'u'
+    else:
+        variety = predict_category.split('_')[-1]
+        color = predict_category.split('_')[0]
 
     # Print the path
     if beginPoint[1] - endPoint[1] > 0:
@@ -124,7 +242,16 @@ def savePath(beginPoint, endPoint, piece):
         end = (end[0] - leftright, end[1])
     else:
         end = (end[0] + leftright, end[1])
-    print('{} moved from point {} to point {}'.format(dic[predict_category], begin, end))
+
+    board_state_map[begin] = 'grid'
+    board_state_map[end] = predict_category
+
+    piece_name = dic.get(predict_category, 'Unknown piece')
+    print('{} moved from point {} to point {}'.format(piece_name, begin, end))
+
+    if not ENFORCE_MOVE_RULES:
+        text = str(int(begin[0])) + str(int(begin[1])) + str(int(end[0])) + str(int(end[1]))
+        return text, predict_category, piece_name, begin, end
 
     # Using chinese chess rules to reduce error movement
     if variety in ['ma']:
@@ -161,7 +288,7 @@ def savePath(beginPoint, endPoint, piece):
     if not legal_move:
         cv2.imwrite('./pieces/%d.png' % np.random.randint(10000), piece)
     text = str(int(begin[0])) + str(int(begin[1])) + str(int(end[0])) + str(int(end[1]))
-    return text, predict_category
+    return text, predict_category, piece_name, begin, end
 
 def findPoint(point, pointset):
     flag = False
@@ -180,17 +307,18 @@ def findPoint(point, pointset):
 def CalculateTrace(pre_img, cur_img, x, y, w, h):
     # Input loca = [x, y, w, h], return all circle center inside the rectangular to pointSet
     pointSet = []
-    beginPoint = []
-    endPoint = []
+    beginPoint = None
+    endPoint = None
     pre_img_gray = cv2.cvtColor(pre_img, cv2.COLOR_BGR2GRAY)
     cur_img_gray = cv2.cvtColor(cur_img, cv2.COLOR_BGR2GRAY)
     pre_img_circle = cv2.HoughCircles(pre_img_gray,cv2.HOUGH_GRADIENT,1,40,param1=100,param2=20,minRadius=18,maxRadius=18)[0]
     cur_img_circle = cv2.HoughCircles(cur_img_gray,cv2.HOUGH_GRADIENT,1,40,param1=100,param2=20,minRadius=18,maxRadius=18)[0]
+
     for j in range(int(np.around(h/GRID_WIDTH_VERTI))):
         for i in range(int(np.around(w/GRID_WIDTH_HORI))):
             pointSet.append([y + (j+0.5)*GRID_WIDTH_VERTI, x + (i+0.5)*GRID_WIDTH_HORI])
     for p in pointSet:
-        if beginPoint != [] and endPoint != []:		# Already find beginPoint and endPoint, exit
+        if beginPoint is not None and endPoint is not None:		# Already find beginPoint and endPoint, exit
             break
         flag1, p1 = findPoint(p, pre_img_circle)
         flag2, p2 = findPoint(p, cur_img_circle)
@@ -198,8 +326,8 @@ def CalculateTrace(pre_img, cur_img, x, y, w, h):
             if flag1 == True and flag2 == False:
                 beginPoint = p1
             elif flag1 == True and flag2 == True:
-                pre_piece = pre_img[ int(p1[1]-p1[2]):int(p1[1]+p1[2]), int(p1[0]-p1[2]):int(p1[0]+p1[2]) ]
-                cur_piece = cur_img[ int(p2[1]-p2[2]):int(p2[1]+p2[2]), int(p2[0]-p2[2]):int(p2[0]+p2[2]) ]
+                pre_piece = crop_with_margin(pre_img, p1)
+                cur_piece = crop_with_margin(cur_img, p2)
                 if PiecePrediction(model, pre_piece, target_size) != PiecePrediction(model, cur_piece, target_size):
                     endPoint = p2
         elif len(pre_img_circle) == len(cur_img_circle):	#没有发生棋子减少情况
@@ -207,11 +335,10 @@ def CalculateTrace(pre_img, cur_img, x, y, w, h):
                 beginPoint = p1
             elif flag1 == False and flag2 == True:
                 endPoint = p2
-    if beginPoint != [] and endPoint != []:
-        piece = pre_img[int(beginPoint[1] - beginPoint[2]):int(beginPoint[1] + beginPoint[2]),
-                int(beginPoint[0] - beginPoint[2]):int(beginPoint[0] + beginPoint[2])]
+    if beginPoint is not None and endPoint is not None:
+        piece = crop_with_margin(pre_img, beginPoint)
     else:
-        return [], [], []
+        return None, None, None
     return beginPoint, endPoint, piece
 
 def changeDetection(previous_step, current_step, visual = False):
@@ -250,46 +377,100 @@ def compare(img1, img2, x, y, w, h):
         dict2[(coordinate[0], coordinate[1])] = cat2
     return operator.eq(dict1, dict2)
 
+
+def is_legal_move(begin, end, predict_category):
+    if predict_category == 'grid':
+        return True
+
+    updown = abs(begin[1] - end[1])
+    leftright = abs(begin[0] - end[0])
+    variety = predict_category.split('_')[-1]
+    color = predict_category.split('_')[0]
+
+    legal = True
+    if variety in ['ma']:
+        legal = (updown == 1 and leftright == 2) or (updown == 2 and leftright == 1)
+    elif variety in ['xiang']:
+        legal = (updown == 2 and leftright == 2)
+    elif variety in ['shi']:
+        legal = (updown == 1 and leftright == 1)
+    elif variety in ['jiang', 'shuai']:
+        legal = (updown == 1 and leftright == 0) or (updown == 0 and leftright == 1)
+    elif variety in ['ju', 'pao']:
+        legal = updown == 0 or leftright == 0
+    elif variety in ['bing']:
+        legal = not (begin[1] < end[1] or (begin[1] >= 5.0 and begin[0] != end[0]) or (begin[1] - end[1] > 1))
+    elif variety in ['zu']:
+        legal = not (begin[1] > end[1] or (begin[1] <= 4.0 and begin[0] != end[0]) or (end[1] - begin[1] > 1))
+
+    if isRed and color == 'b':
+        legal = False
+        print('It''s red team''s turn to move')
+    if (not isRed) and color == 'r':
+        legal = False
+        print('It''s black team''s turn to move')
+
+    return legal
+
+
+def infer_move_from_states(prev_map, curr_map):
+    prev_cells = set(prev_map.keys())
+    curr_cells = set(curr_map.keys())
+
+    removed = list(prev_cells - curr_cells)
+    added = list(curr_cells - prev_cells)
+    changed = [c for c in (prev_cells & curr_cells) if prev_map.get(c) != curr_map.get(c)]
+
+    if not removed:
+        return None, None, None
+
+    begin = removed[0]
+    end = None
+
+    if added:
+        end = added[0]
+    elif changed:
+        end = changed[0]
+    else:
+        return None, None, None
+
+    piece_label = prev_map.get(begin, 'grid')
+    if piece_label == 'grid':
+        piece_label = curr_map.get(end, 'grid')
+
+    return begin, end, piece_label
+
 def PiecesChangeDetection(current_step):
     global legal_move
     previous_step = cv2.imread('./Test_Image/Step %d.png' % step)
     x, y, w, h = changeDetection(previous_step, current_step, False)
-    if w * h < 50*50 or x == 0 or y == 0 or x+w == 480 or y+h == 480:	#棋子没有移动
+    # Keep only very tiny/noisy changes; edge moves should still be considered.
+    if w * h < 30*30:
         return 0
-    else:
-        beginPoint, endPoint, piece = CalculateTrace(previous_step, current_step, x, y, w, h)
-        if beginPoint != [] and endPoint != [] and piece != []:
-            text, predict_category = savePath(beginPoint, endPoint, piece)
-            # if legal_move:
-            # 	sql2 = "INSERT INTO chess(STEP) VALUES (\'%s\')" % text
-            # 	cursor.execute(sql2)
-            # 	db.commit()
-            # else:
-            # 	print('%s performed a illegal movement!' % dic[predict_category])
-        else:
-            return 0
-        # if legal_move:
-        # 	cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
-        # 	return 1
-        # else:
-        # 	print('Please rollback to step %d' % step)
-        # 	while (True):
-        # 		r, frame = cap.read()
-        # 		frame = frame[0:480, 0:480]
-        # 		x, y, w, h = changeDetection(previous_step, frame)
-        # 		if x != 0 and y != 0 and x + w != 480 and y + h != 480 and compare(previous_step, frame, x, y, w, h):
-        # 			legal_move = True
-        # 			cv2.imwrite('./Test_Image/Step %d.png' % step, frame)
-        # 			print('Rollback successfully!')
-        # 			break
-        # 	return 0
-        if legal_move:
-            cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
-            return 1
-        else:
-            print('Illegal move detected – skip rollback (debug mode).')
-            legal_move = True
-            return 0
+
+    prev_map = dict(board_state_map)
+    curr_map = detect_board_map(current_step)
+    begin, end, predict_category = infer_move_from_states(prev_map, curr_map)
+    if begin is None or end is None:
+        return 0
+
+    board_state_map.clear()
+    board_state_map.update(curr_map)
+
+    piece_name = dic.get(predict_category, 'Unknown piece')
+    print('{} moved from point {} to point {}'.format(piece_name, begin, end))
+
+    legal_move = is_legal_move(begin, end, predict_category) if ENFORCE_MOVE_RULES else True
+    if legal_move:
+        cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
+        save_move_snapshot(current_step, step, piece_name, begin, end, legal=True)
+        return 1
+
+    print('Illegal move detected – skip rollback (debug mode), advance frame.')
+    cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
+    save_move_snapshot(current_step, step, piece_name, begin, end, legal=False)
+    legal_move = True
+    return 1
 
 # if __name__ == '__main__':
 # 	# Initialize camera
@@ -510,61 +691,124 @@ def PiecesChangeDetection(current_step):
 
 if __name__ == '__main__':
     # cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    cap = cv2.VideoCapture('./Sources/test.avi')
+    # cap = cv2.VideoCapture('./Sources/test.avi')
+    cap = cv2.VideoCapture('./Sources/test6.mp4')
 
     if not cap.isOpened():
         exit('Camera is not open.')
 
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if source_fps is None or source_fps <= 1 or source_fps > 240:
+        source_fps = 30.0
+    STEP0_STABLE_FRAMES_REQUIRED = max(8, int(source_fps * STEP0_STABLE_SECONDS_REQUIRED))
+    STABLE_FRAMES_REQUIRED = max(4, int(source_fps * STABLE_SECONDS_REQUIRED))
+    frame_wait_ms = max(1, int(1000.0 / source_fps))
+
     print("Camera mở rồi.")
-    print("Đặt bàn cờ vào trong KHUNG VUÔNG.")
-    print("Bấm phím 's' để CHỤP Step 0, 'q' để thoát.")
+    print("Đặt bàn cờ vào trong KHUNG VUÔNG (I/J/K/L để di chuyển, +/- để đổi kích thước, F để fit tối đa).")
+    print("Đang chờ khung hình ổn định để tự động chụp Step 0 (2-3 giây), bấm 'q' để thoát.")
 
     step0 = None
     os.makedirs('./Test_Image', exist_ok=True)
+    init_prev_gray = None
+    init_stable_count = 0
+    roi = None
 
     while True:
-        ret, current_frame = cap.read()
+        ret, raw_frame = cap.read()
         if not ret:
             print("Không đọc được frame từ camera.")
             break
 
-        # Cắt 480x480 góc trên trái
-        current_frame = current_frame[0:480, 0:480]
+        h, w = raw_frame.shape[:2]
+        if roi is None:
+            side = int(min(w, h) * 0.95)
+            x = (w - side) // 2
+            y = (h - side) // 2
+            roi = normalize_roi(x, y, side, w, h)
 
-        # Vẽ khung như code gốc của bạn
-        cv2.rectangle(
-            current_frame,
-            ad.begin,
-            (ad.begin[0] + 400, ad.begin[1] + 400),
-            (255, 255, 255),
-            2
-        )
+        view = raw_frame.copy()
+        x0, y0, side = roi
+        x1, y1 = x0 + side, y0 + side
+        cv2.rectangle(view, (x0, y0), (x1, y1), (255, 255, 255), 2)
 
-        # Tính toạ độ khung
-        x0, y0 = ad.begin
-        x1, y1 = x0 + 400, y0 + 400
-
-       # Tâm khung
         cx = (x0 + x1) // 2
         cy = (y0 + y1) // 2
+        cv2.line(view, (cx, y0), (cx, y1), (255, 255, 255), 1)
+        cv2.line(view, (x0, cy), (x1, cy), (255, 255, 255), 1)
 
-# Vẽ đường dọc đi qua tâm
-        cv2.line(current_frame, (cx, y0), (cx, y1), (255, 255, 255), 1)
-
-# Vẽ đường ngang đi qua tâm
-        cv2.line(current_frame, (x0, cy), (x1, cy), (255, 255, 255), 1)
-
-        cv2.imshow("Canh khung rồi bấm 's' để chụp Step 0", current_frame)
-        key = cv2.waitKey(10) & 0xFF
-
-        if key == ord('s'):
-            # Lưu frame hiện tại làm Step 0
-            step0 = current_frame.copy()
-            cv2.imwrite('./Test_Image/Step 0.png', step0)
-            print("Đã chụp Step 0, shape =", step0.shape)
+        current_frame = extract_process_frame(raw_frame, roi)
+        if current_frame is None:
             break
 
-        elif key == ord('q'):
+        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        if init_prev_gray is not None:
+            delta = cv2.absdiff(gray, init_prev_gray)
+            score = cv2.countNonZero(cv2.threshold(delta, 20, 255, cv2.THRESH_BINARY)[1])
+            if score < STEP0_STABLE_DIFF_THRESHOLD:
+                init_stable_count += 1
+            else:
+                init_stable_count = 0
+
+        init_prev_gray = gray
+
+        remaining = max(0, STEP0_STABLE_FRAMES_REQUIRED - init_stable_count)
+        cv2.putText(
+            view,
+            f"Auto Step0 in: {remaining}",
+            (8, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            view,
+            f"I/J/K/L: move ROI, +/-: size, F: fit max | ROI: {side}x{side}",
+            (8, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow("Canh khung - tu dong chup Step 0", view)
+        key = cv2.waitKey(frame_wait_ms) & 0xFF
+
+        if init_stable_count >= STEP0_STABLE_FRAMES_REQUIRED:
+            step0 = current_frame.copy()
+            cv2.imwrite('./Test_Image/Step 0.png', step0)
+            print("Đã tự động chụp Step 0, shape =", step0.shape)
+            break
+
+        if key in (ord('i'), ord('I')):
+            roi = normalize_roi(x0, y0 - ROI_MOVE_STEP, side, w, h)
+            init_stable_count = 0
+        elif key in (ord('k'), ord('K')):
+            roi = normalize_roi(x0, y0 + ROI_MOVE_STEP, side, w, h)
+            init_stable_count = 0
+        elif key in (ord('j'), ord('J')):
+            roi = normalize_roi(x0 - ROI_MOVE_STEP, y0, side, w, h)
+            init_stable_count = 0
+        elif key in (ord('l'), ord('L')):
+            roi = normalize_roi(x0 + ROI_MOVE_STEP, y0, side, w, h)
+            init_stable_count = 0
+        elif key in (ord('+'), ord('=')):
+            roi = normalize_roi(x0 - ROI_SIZE_STEP // 2, y0 - ROI_SIZE_STEP // 2, side + ROI_SIZE_STEP, w, h)
+            init_stable_count = 0
+        elif key in (ord('-'), ord('_')):
+            roi = normalize_roi(x0 + ROI_SIZE_STEP // 2, y0 + ROI_SIZE_STEP // 2, side - ROI_SIZE_STEP, w, h)
+            init_stable_count = 0
+        elif key in (ord('f'), ord('F')):
+            fit_side = int(min(w, h) * 0.98)
+            fit_x = (w - fit_side) // 2
+            fit_y = (h - fit_side) // 2
+            roi = normalize_roi(fit_x, fit_y, fit_side, w, h)
+            init_stable_count = 0
+
+        if key == ord('q'):
             break
 
     if step0 is None:
@@ -574,50 +818,59 @@ if __name__ == '__main__':
 
     print('Camera Initialized.')
     previous_frame = step0.copy()
+    prev_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+    stable_count = 0
+    motion_active = False
+    frame_index = 0
 
     Initialization()
 
     # --- Vòng lặp chính phía sau giữ như cũ ---
     while cap.isOpened():
-        ret, current_frame = cap.read()
+        ret, raw_frame = cap.read()
         if not ret:
             break
+        frame_index += 1
 
-        current_frame = current_frame[0:480, 0:480]
-        # current_frame = cv2.resize(current_frame, (480, 480))
+        h, w = raw_frame.shape[:2]
+        roi = normalize_roi(roi[0], roi[1], roi[2], w, h)
+        current_frame = extract_process_frame(raw_frame, roi)
+        if current_frame is None:
+            break
 
-        x, y, w, h = changeDetection(current_frame, previous_frame)
-        if (x == 0 and y == 0 and w == 480 and h == 480):
+        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        frame_delta = cv2.absdiff(gray, prev_gray)
+        motion_score = cv2.countNonZero(cv2.threshold(frame_delta, MOTION_BINARY_THRESHOLD, 255, cv2.THRESH_BINARY)[1])
+
+        if motion_score < STABLE_DIFF_THRESHOLD:
+            stable_count += 1
+        else:
+            motion_active = True
+            stable_count = 0
+
+        # Trigger detection when movement has happened and scene becomes stable again.
+        if motion_active and stable_count >= STABLE_FRAMES_REQUIRED:
             num = PiecesChangeDetection(current_frame)
             if num == 1:
                 step += 1
                 isRed = bool(1 - isRed)
+            motion_active = False
+            stable_count = 0
+
+        # Fast-move fallback: periodically try detection while motion is ongoing.
+        if motion_active and frame_index % DETECT_DURING_MOTION_EVERY == 0:
+            num = PiecesChangeDetection(current_frame)
+            if num == 1:
+                step += 1
+                isRed = bool(1 - isRed)
+                motion_active = False
+                stable_count = 0
 
         previous_frame = current_frame.copy()
+        prev_gray = gray
 
-        cv2.rectangle(
-            current_frame,
-            ad.begin,
-            (ad.begin[0] + 400, ad.begin[1] + 400),
-            (255, 255, 255),
-            2
-        )
-
-                # Tính toạ độ khung
-        x0, y0 = ad.begin
-        x1, y1 = x0 + 400, y0 + 400
-
-       # Tâm khung
-        cx = (x0 + x1) // 2
-        cy = (y0 + y1) // 2
-
-# Vẽ đường dọc đi qua tâm
-        cv2.line(current_frame, (cx, y0), (cx, y1), (255, 255, 255), 1)
-
-# Vẽ đường ngang đi qua tâm
-        cv2.line(current_frame, (x0, cy), (x1, cy), (255, 255, 255), 1)
-        cv2.imshow('', current_frame)
-        key = cv2.waitKey(1) & 0xFF
+        cv2.imshow('Chinese Chess Tracker', current_frame)
+        key = cv2.waitKey(frame_wait_ms) & 0xFF
         if key == ord('q'):
             break
 

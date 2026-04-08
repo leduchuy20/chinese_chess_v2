@@ -1,7 +1,7 @@
 import AdjustCameraLocation as ad
 import cv2, os, time
 import numpy as np
-import onnxruntime as ort
+from piece_detector import PieceDetector
 
 # --- CẤU HÌNH ---
 IS_RED_TURN = True  # Lượt đi hiện tại
@@ -19,33 +19,20 @@ dic_name = {'b_jiang':'Black General', 'b_ju':'Black Rook', 'b_ma':'Black Horse'
             'r_shi':'Red Guard', 'r_shuai':'Red General', 'r_xiang':'Red Elephant'}
 
 # --- BIẾN TOÀN CỤC ---
-ort_session = None
-input_name = None
+detector = None
 grid_points = []  # Danh sách 90 toạ độ (x, y)
 board_state = []  # Trạng thái hiện tại của 90 ô (Lưu tên quân cờ)
 bg_means = []  # Lưu độ sáng trung bình của 90 ô để so sánh nhanh
 
 
-def init_onnx():
-    global ort_session, input_name
-    model_path = 'chinese_chess_model.onnx'
-    if not os.path.exists(model_path):
-        exit(f"Lỗi: Không tìm thấy {model_path}")
-    ort_session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-    input_name = ort_session.get_inputs()[0].name
+def init_model():
+    global detector
+    detector = PieceDetector(weights_path='./weights.pt', imgsz=640, conf=0.25)
     print("AI Model loaded.")
 
 
 def predict_piece(img_roi):
-    # Pre-process giống lúc train
-    img = cv2.resize(img_roi, (56, 56))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype('float32') / 255.0
-    img = np.expand_dims(img, axis=0)
-
-    preds = ort_session.run(None, {input_name: img})[0]
-    idx = int(np.argmax(preds, axis=1)[0])
-    return label_type[idx]
+    return detector.predict_piece(img_roi, default_label='grid')
 
 
 def init_grid(frame):
@@ -184,7 +171,7 @@ if __name__ == '__main__':
         cv2.putText(frame, "Canh khung & Bam 's' de bat dau", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.imshow('Setup', frame)
         if cv2.waitKey(1) & 0xFF == ord('s'):
-            init_onnx()
+            init_model()
             init_grid(frame)  # Khởi tạo lưới dựa trên hình ảnh tĩnh đầu tiên
             break
 

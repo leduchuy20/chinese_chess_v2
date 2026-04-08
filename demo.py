@@ -3,7 +3,7 @@
 import AdjustCameraLocation as ad
 import cv2, os, operator
 import numpy as np
-from CNN_Classification_Model.model import cnn_model
+from piece_detector import PieceDetector
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -25,10 +25,8 @@ def initialization():
     step = 0		# For recording steps
     legal_move = True	# To decide if the move is legal or illegal
     isRed = True		# To decide which team moves now
-    target_size = (56, 56)		# CNN input image size
-    model = cnn_model()
-    model.load_weights('./h5_file/new_model_v2.keras')
-    # model = load_model('./h5_file/new_model_v2.h5')	# Machine Learning Model
+    target_size = (640, 640)
+    model = PieceDetector(weights_path='./weights.pt', imgsz=640, conf=0.25)
 
     # Initialize grid width
     frame0 = cv2.imread('./Test_Image/Step 0.png', 0)
@@ -41,16 +39,7 @@ def initialization():
 
 
 def piece_prediction(model, img, target_size, top_n=3):
-    x = cv2.resize(img, target_size)
-    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
-    x = x.astype('float32') / 255.0
-    x = np.expand_dims(x, axis=0)
-
-    # Tắt progress bar
-    preds = model.predict(x, verbose=0)
-
-    idx = int(np.argmax(preds, axis=1)[0])
-    return label_type[idx]
+    return model.predict_piece(img, default_label='grid')
 
 
 def save_path(beginPoint, endPoint, piece):
@@ -77,7 +66,7 @@ def save_path(beginPoint, endPoint, piece):
         end = (end[0] + leftright, end[1])
 
     if predict_category == 'grid':
-        return None
+        return None, predict_category
 
     print('{} moved from point {} to point {}'.format(dic[predict_category], begin, end))
 
@@ -220,6 +209,8 @@ def pieces_change_detection(current_step):
         beginPoint, endPoint, piece = calculate_trace(previous_step, current_step, x, y, w, h)
         if beginPoint != [] and endPoint != [] and piece != []:
             text, predict_category = save_path(beginPoint, endPoint, piece)
+            if text is None:
+                return 0
 
         else:
             return 0
