@@ -381,6 +381,7 @@ def compare(img1, img2, x, y, w, h):
 def is_legal_move(begin, end, predict_category):
     if predict_category == 'grid':
         return True
+    
 
     updown = abs(begin[1] - end[1])
     leftright = abs(begin[0] - end[0])
