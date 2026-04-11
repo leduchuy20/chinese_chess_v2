@@ -42,7 +42,9 @@ LABEL_ALIASES = {
     "b_guard": "b_shi",
     "black_guard": "b_shi",
     "b_advisor": "b_shi",
+    "b_adviser": "b_shi",
     "black_advisor": "b_shi",
+    "black_adviser": "b_shi",
     "b_elephant": "b_xiang",
     "black_elephant": "b_xiang",
     "b_bishop": "b_xiang",
@@ -68,7 +70,9 @@ LABEL_ALIASES = {
     "r_guard": "r_shi",
     "red_guard": "r_shi",
     "r_advisor": "r_shi",
+    "r_adviser": "r_shi",
     "red_advisor": "r_shi",
+    "red_adviser": "r_shi",
     "r_elephant": "r_xiang",
     "red_elephant": "r_xiang",
     "r_bishop": "r_xiang",
@@ -208,3 +212,48 @@ class PieceDetector:
             )
 
         return detections
+
+    def predict_board_state(
+        self,
+        image: np.ndarray,
+        begin_pt,
+        grid_w: float,
+        grid_h: float,
+        conf: float | None = None,
+    ) -> tuple[dict, dict]:
+        """
+        Single YOLO inference trên toàn bộ ảnh bàn cờ.
+        Snap tâm mỗi detection về ô lưới (bx, by) gần nhất.
+        Trả về (label_map, conf_map) — nhanh hơn nhiều so với gọi predict_piece() 90 lần.
+
+        Args:
+            image:     Ảnh bàn cờ (BGR numpy array).
+            begin_pt:  Toạ độ pixel (x, y) của góc trên-trái bàn cờ.
+            grid_w:    Khoảng cách pixel giữa 2 cột lưới liền nhau.
+            grid_h:    Khoảng cách pixel giữa 2 hàng lưới liền nhau.
+            conf:      Ngưỡng confidence; None = dùng self.conf.
+
+        Returns:
+            label_map: {(bx, by): label_str}
+            conf_map:  {(bx, by): float_confidence}
+        """
+        if image is None or image.size == 0:
+            return {}, {}
+
+        detections = self.predict_detections(image, conf=conf)
+        board: dict = {}
+        for det in detections:
+            label = det['label']
+            if label == 'grid':
+                continue
+            bx = int(round((det['cx'] - begin_pt[0]) / grid_w))
+            by = int(round((det['cy'] - begin_pt[1]) / grid_h))
+            if not (0 <= bx <= 8 and 0 <= by <= 9):
+                continue
+            key = (bx, by)
+            if key not in board or det['conf'] > board[key][1]:
+                board[key] = (label, float(det['conf']))
+
+        label_map = {k: v[0] for k, v in board.items()}
+        conf_map = {k: v[1] for k, v in board.items()}
+        return label_map, conf_map

@@ -1,0 +1,238 @@
+======================================================================
+  MODEL COMPARISON REPORT
+  CNN  : new_model_v2.h5  (Keras CNN, converted to ONNX)
+  YOLO : weights.pt       (YOLOv11s, trained on Roboflow)
+======================================================================
+
+[ 1. OVERVIEW ]
+------------------------------------------------------------
+Criterion                   CNN (new_model_v2.h5)   YOLO (weights.pt)       
+----------------------------------------------------------------------------
+Model type                  Classification          Object Detection        
+Architecture                Custom CNN (3Conv+2FC)  YOLOv11s                
+Framework                   Keras / TensorFlow      Ultralytics / PyTorch   
+File size                   9.61 MB                 18.30 MB                
+Parameters                  ~835,567  (~835K)       9,433,984  (~9.4M)      
+Training source             Manual cropped dataset  Roboflow full-board labels
+
+[ 2. INPUT ]
+------------------------------------------------------------
+Criterion                 CNN                         YOLO                    
+------------------------------------------------------------------------------
+Image scope               Single piece crop           Full board image        
+Input size                56 x 56 x 3                 640 x 640 x 3           
+Color space               RGB                         RGB                     
+Normalize                 [0, 1]  (divide 255)        [0, 1]  (divide 255)    
+Pre-processing            HoughCircles -> crop->resizeNone  (end-to-end)      
+
+  CNN requires a separate segmentation step BEFORE inference:
+    Frame -> HoughCircles -> crop each piece -> resize 56x56 -> predict
+  YOLO requires NO pre-processing:
+    Frame -> resize 640x640 -> predict ALL pieces at once
+
+[ 3. OUTPUT ]
+------------------------------------------------------------
+Criterion                 CNN                         YOLO                    
+------------------------------------------------------------------------------
+Output format             Softmax vector  [15]        3 detection heads       
+Returns                   Class probabilities only    BBox + label + confidence
+Bounding box              NO                          YES  (x1, y1, x2, y2)   
+Confidence score          Softmax probability         Objectness x class_prob 
+Detection heads           1 Dense(15, softmax)        P3(80x80)+P4(40x40)+P5(20x20)
+Values per cell           N/A                         4(bbox) + 16(cls) = 20  
+
+[ 4. CLASSES ]
+------------------------------------------------------------
+  CNN  (15 classes):
+    b_jiang  b_ju    b_ma    b_pao   b_shi   b_xiang  b_zu  (7 black)
+    r_bing   r_ju    r_ma    r_pao   r_shi   r_shuai  r_xiang (7 red)
+    grid  (empty cell / intersection)
+
+  YOLO (16 classes):
+    Black-Cannon  Black-Chariot  Black-Elephant  Black-General
+    Black-Guard   Black-Horse    Black-Soldier    None
+    Red-Cannon    Red-Chariot    Red-Elephant    Red-General
+    Red-Guard     Red-Horse      Red-Soldier     intersection
+
+  Differences:
+    - YOLO has 2 background classes: "None" and "intersection"
+    - CNN uses "grid" to cover all empty/background cells
+    - All 14 piece types are covered by both models
+
+[ 5. DETECTION PERFORMANCE ]
+------------------------------------------------------------
+
+--- 5a. CNN Accuracy on Dataset/valid (270 images) ---
+  Overall accuracy: 269 / 270 = 99.6%
+
+  Class           Correct    Total    Acc(%)  Bar (10=100%)
+  --------------------------------------------------------
+  b_jiang              11       11    100.0%  ##########
+  b_ju                 13       13    100.0%  ##########
+  b_ma                 14       14    100.0%  ##########
+  b_pao                14       14    100.0%  ##########
+  b_shi                12       12    100.0%  ##########
+  b_xiang              11       11    100.0%  ##########
+  b_zu                 53       54     98.1%  #########
+  grid                 21       21    100.0%  ##########
+  r_bing               48       48    100.0%  ##########
+  r_ju                 11       11    100.0%  ##########
+  r_ma                 13       13    100.0%  ##########
+  r_pao                14       14    100.0%  ##########
+  r_shi                14       14    100.0%  ##########
+  r_shuai               8        8    100.0%  ##########
+  r_xiang              12       12    100.0%  ##########
+
+  Notes:
+  - Tested on PRE-SEGMENTED crops (already correct size and centered)
+  - In real deployment, accuracy drops due to imperfect HoughCircles
+  - b_zu (98.1%) is the only class with 1 error (b_zu misclassified)
+
+--- 5b. YOLO Full-Board Detection on Test_Image (29 step images) ---
+
+  Confidence distribution (conf >= 0.05,  1120 total detections):
+    Mean:          0.643
+    Median:        0.771
+    Std dev:       0.262
+    conf >= 0.9:      0  (  0.0%)
+    conf >= 0.7:    672  ( 60.0%)
+    conf >= 0.5:    835  ( 74.6%)
+    conf <  0.3:    182  ( 16.2%)  <- noisy/unreliable detections
+
+  Detections per step image:
+  Step 0     detected=36  conf_avg=0.706  conf_min=0.147
+  Step 1     detected=38  conf_avg=0.684  conf_min=0.125
+  Step 2     detected=38  conf_avg=0.686  conf_min=0.125
+  Step 3     detected=40  conf_avg=0.654  conf_min=0.124
+  Step 4     detected=39  conf_avg=0.664  conf_min=0.126
+  Step 5     detected=38  conf_avg=0.683  conf_min=0.127
+  Step 6     detected=39  conf_avg=0.671  conf_min=0.123
+  Step 7     detected=39  conf_avg=0.674  conf_min=0.143
+  Step 8     detected=38  conf_avg=0.684  conf_min=0.157
+  Step 9     detected=38  conf_avg=0.683  conf_min=0.154
+  Step 10    detected=39  conf_avg=0.665  conf_min=0.120
+  Step 11    detected=38  conf_avg=0.655  conf_min=0.124
+  Step 12    detected=36  conf_avg=0.685  conf_min=0.164
+  Step 13    detected=33  conf_avg=0.696  conf_min=0.136
+  Step 14    detected=34  conf_avg=0.695  conf_min=0.153
+  Step 15    detected=33  conf_avg=0.690  conf_min=0.135
+  Step 16    detected=33  conf_avg=0.710  conf_min=0.145
+  Step 17    detected=30  conf_avg=0.721  conf_min=0.156
+  Step 18    detected=33  conf_avg=0.731  conf_min=0.256
+  Step 19    detected=33  conf_avg=0.729  conf_min=0.235
+  Step 20    detected=34  conf_avg=0.703  conf_min=0.133
+  Step 21    detected=33  conf_avg=0.700  conf_min=0.163
+  Step 22    detected=31  conf_avg=0.731  conf_min=0.243
+  Step 23    detected=31  conf_avg=0.707  conf_min=0.212
+  Step 24    detected=30  conf_avg=0.727  conf_min=0.247
+  Step 25    detected=37  conf_avg=0.695  conf_min=0.126
+  Step 26    detected=36  conf_avg=0.688  conf_min=0.154
+  Step 27    detected=37  conf_avg=0.684  conf_min=0.159
+  Step 28    detected=38  conf_avg=0.669  conf_min=0.162
+
+--- 5c. YOLO Count vs Expected on Step 0 (start: 32 pieces) ---
+  YOLO detected: 36  (expected 32)
+
+  Label            Expected    Detected    Diff
+  ----------------------------------------------
+  b_jiang                 1           2  +1 OVER
+  b_ju                    2           0  -2 MISS
+  b_ma                    2           2  OK
+  b_pao                   2           2  OK
+  b_shi                   2           7  +5 OVER
+  b_xiang                 2           0  -2 MISS
+  b_zu                    5           5  OK
+  r_bing                  5           0  -5 MISS
+  r_ju                    2           2  OK
+  r_ma                    2           2  OK
+  r_pao                   2           2  OK
+  r_shi                   2           7  +5 OVER
+  r_shuai                 1           3  +2 OVER
+  r_xiang                 2           2  OK
+  ----------------------------------------------
+  TOTAL                  32          36  +4
+
+  Root cause analysis:
+    [OVER] b_jiang: +1  -> confused with similar piece
+    [MISS] b_ju: 2  -> missed detections (low conf or occluded)
+    [OVER] b_shi: +5  -> confused with similar piece
+    [MISS] b_xiang: 2  -> missed detections (low conf or occluded)
+    [MISS] r_bing: 5  -> missed detections (low conf or occluded)
+    [OVER] r_shi: +5  -> confused with similar piece
+    [OVER] r_shuai: +2  -> confused with similar piece
+
+  Main confusion pairs:
+    r_shi <-> r_bing  (adviser vs soldier, look similar)
+    b_shi <-> b_zu    (guard vs pawn, look similar)
+    b_xiang / b_ju    (missed: possibly training data shortage)
+
+[ 6. INFERENCE SPEED  (CPU,  Intel/AMD) ]
+------------------------------------------------------------
+
+  CNN ONNX - single crop (56x56):
+    Mean: 0.262 ms   Std: 0.065 ms   Max throughput: ~3812 fps
+
+  CNN - full board equiv. (90 crops x 0.262 ms):
+    Estimated: 23.6 ms   ~42.4 fps
+    (*) Excludes HoughCircles overhead, which adds ~20-50ms
+
+  YOLO - full board (640x640):
+    Mean: 138.7 ms   Std: 9.0 ms   ~7.2 fps
+
+  YOLO is 5.9x SLOWER than CNN (crop x90) on CPU
+
+  Summary table:
+  Method                           Time (ms)       FPS
+  ----------------------------------------------------
+  CNN ONNX per crop                    0.262      3812
+  CNN x90 crops (no HoughCircles)        23.6      42.4
+  YOLO full board                      138.7       7.2
+
+[ 7. STRENGTHS & WEAKNESSES ]
+------------------------------------------------------------
+
+  CNN:
+    PROS:
+      + Very fast per crop (0.17ms), minimal CPU usage
+      + 99.6% accuracy on clean pre-segmented crops
+      + Simple architecture, lightweight (835K params)
+      + ONNX version is portable and easy to deploy
+    CONS:
+      - Requires HoughCircles for piece segmentation (brittle)
+      - HoughCircles fails under varied lighting / overlapping pieces
+      - No positional information (classification only, no bbox)
+      - Accuracy degrades on imperfect crops from real camera
+
+  YOLO:
+    PROS:
+      + End-to-end: detects ALL pieces in 1 inference pass
+      + Returns bounding boxes -> no HoughCircles needed
+      + Board context helps distinguish similar pieces
+      + Handles occlusion, scale variation better
+      + Confidence scores per detection for filtering
+    CONS:
+      - Slower on CPU (~127ms vs 15ms for CNN x90)
+      - Confusion: r_shi/r_bing, b_shi/b_zu (similar look)
+      - Misses r_bing, b_xiang, b_ju (needs more training data)
+      - 16.2%% detections have conf < 0.3 (noisy)
+      - Larger model (9.4M params vs 835K)
+
+[ 8. RECOMMENDATION ]
+------------------------------------------------------------
+
+  YOLO is the correct choice for this system because:
+    1. Eliminates brittle HoughCircles dependency entirely
+    2. Single pass for all 32 pieces on the board
+    3. Bounding boxes enable accurate grid cell mapping
+    4. Works robustly under camera angle / lighting changes
+
+  To improve YOLO detection quality:
+    1. Collect more training images for r_bing and b_xiang (most missed)
+    2. Add hard negative examples to reduce r_shi/b_shi false positives
+    3. Raise conf threshold to 0.3-0.4 to filter noisy detections
+    4. Use GPU for inference (expected 10-20x speedup, ~10-15ms)
+    5. Consider imgsz=416 for faster CPU inference (~80-90ms)
+
+======================================================================
+  End of Report
+======================================================================

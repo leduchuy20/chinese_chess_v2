@@ -3,6 +3,9 @@ import AdjustCameraLocation as ad
 import cv2, os, pymysql, operator, copy
 import numpy as np
 import time
+import threading
+import queue as _q
+from collections import Counter
 from piece_detector import PieceDetector
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -17,6 +20,10 @@ ROI_MOVE_STEP = 12
 ROI_SIZE_STEP = 20
 MOTION_BINARY_THRESHOLD = 15
 DETECT_DURING_MOTION_EVERY = 4
+ENABLE_DETECT_DURING_MOTION = False
+BOARD_DETECT_CONF = 0.12
+LABEL_SWITCH_CONF_MIN = 0.45
+SOLDIER_ADVISER_SWITCH_CONF_MIN = 0.72
 
 
 ip = ad.ip
@@ -29,6 +36,66 @@ dic = {'b_jiang':'Black King', 'b_ju':'Black Rook', 'b_ma':'Black Knight', 'b_pa
         'r_bing':'Red Soldier', 'r_ju':'Red Chariot', 'r_ma':'Red Horse', 'r_pao':'Red Cannon', 'r_shi':'Red Adviser', 'r_shuai':'Red General', 'r_xiang':'Red Minister'}
 
 board_state_map = {}
+
+
+class TemporalBoardVoter:
+    """
+    Lưu lịch sử N lần quét bàn cờ gần nhất.
+    get_stable_state() trả về trạng thái được vote đa số trên từng ô lưới,
+    giúp lọc nhiễu single-frame từ YOLO (nhầm lẫn r_bing/r_shi, b_zu/b_shi...).
+    """
+
+    def __init__(self, window: int = 5):
+        self.window = window
+        self._history: list[dict] = []
+
+    def push(self, label_map: dict) -> None:
+        self._history.append(dict(label_map))
+        if len(self._history) > self.window:
+            self._history.pop(0)
+
+    def clear(self) -> None:
+        self._history.clear()
+
+    def ready(self) -> bool:
+        """True khi đã có ít nhất 2 mẫu để vote."""
+        return len(self._history) >= 2
+
+    def get_stable_state(self) -> dict:
+        """Majority-vote nhãn theo từng ô (bx, by). Ô có đa số 'grid' bị bỏ qua."""
+        if not self._history:
+            return {}
+        all_keys: set = set()
+        for m in self._history:
+            all_keys.update(m.keys())
+        threshold = max(1, len(self._history) // 2 + 1)
+        result: dict = {}
+        for key in all_keys:
+            labels = [m.get(key, 'grid') for m in self._history]
+            best_label, best_count = Counter(labels).most_common(1)[0]
+            if best_label != 'grid' and best_count >= threshold:
+                result[key] = best_label
+        return result
+
+
+board_voter = TemporalBoardVoter(window=5)
+
+# --- Background detection thread ---
+_detect_lock = threading.Lock()
+_detect_active = False          # True khi inference đang chạy trong thread
+_detect_result_q = _q.Queue(maxsize=1)  # Nhận kết quả 0/1 từ thread
+
+
+def _detection_worker(frame: np.ndarray) -> None:
+    """Chạy PiecesChangeDetection trong background thread để không block display."""
+    global _detect_active
+    result = PiecesChangeDetection(frame)
+    try:
+        _detect_result_q.put_nowait(result)
+    except _q.Full:
+        pass
+    with _detect_lock:
+        _detect_active = False
 
 
 def normalize_roi(x, y, side, frame_w, frame_h):
@@ -145,8 +212,28 @@ def board_xy_to_pixel(cell):
     )
 
 
-def detect_board_map(frame):
-    detections = model.predict_detections(frame, conf=0.08)
+def is_in_palace(color, bx, by):
+    if not (3 <= bx <= 5):
+        return False
+    if color == 'r':
+        return 7 <= by <= 9
+    if color == 'b':
+        return 0 <= by <= 2
+    return False
+
+
+def correct_label_by_position(label, bx, by, score):
+    # Advisers must stay inside the palace in Xiangqi.
+    # If detected outside palace, remap to soldier to reduce r_bing -> r_shi confusion.
+    if label == 'r_shi' and (not is_in_palace('r', bx, by)):
+        return 'r_bing'
+    if label == 'b_shi' and (not is_in_palace('b', bx, by)):
+        return 'b_zu'
+    return label
+
+
+def detect_board_map(frame, prev_map=None, return_conf=False):
+    detections = model.predict_detections(frame, conf=BOARD_DETECT_CONF)
     board_map = {}
 
     for det in detections:
@@ -160,10 +247,40 @@ def detect_board_map(frame):
 
         key = (bx, by)
         score = det['conf']
+        label = correct_label_by_position(label, bx, by, score)
         if key not in board_map or score > board_map[key][1]:
             board_map[key] = (label, score)
 
-    return {k: v[0] for k, v in board_map.items()}
+    if prev_map:
+        stabilized = {}
+        stabilized_conf = {}
+        for key, (label, score) in board_map.items():
+            prev_label = prev_map.get(key)
+            is_soldier_adviser_flip = (prev_label, label) in {
+                ('r_bing', 'r_shi'),
+                ('r_shi', 'r_bing'),
+                ('b_zu', 'b_shi'),
+                ('b_shi', 'b_zu'),
+            }
+
+            # If label flips at the same cell with weak confidence, keep previous label.
+            if prev_label and prev_label in dic and prev_label != label and score < LABEL_SWITCH_CONF_MIN:
+                stabilized[key] = prev_label
+            elif prev_label and prev_label in dic and is_soldier_adviser_flip and score < SOLDIER_ADVISER_SWITCH_CONF_MIN:
+                stabilized[key] = prev_label
+            else:
+                stabilized[key] = label
+            stabilized_conf[key] = score
+
+        if return_conf:
+            return stabilized, stabilized_conf
+        return stabilized
+
+    label_map = {k: v[0] for k, v in board_map.items()}
+    if return_conf:
+        conf_map = {k: v[1] for k, v in board_map.items()}
+        return label_map, conf_map
+    return label_map
 
 
 def init_board_state(step0_path):
@@ -414,64 +531,132 @@ def is_legal_move(begin, end, predict_category):
     return legal
 
 
-def infer_move_from_states(prev_map, curr_map):
-    prev_cells = set(prev_map.keys())
-    curr_cells = set(curr_map.keys())
+def _score_move_candidate(piece_label: str, begin: tuple, end: tuple) -> float:
+    """
+    Tính điểm cho cặp (begin → end) dựa trên luật di chuyển của quân cờ.
+    Điểm cao hơn = khả năng là nước đi đúng cao hơn.
+    Trả về -inf nếu là nước đứng yên (dx=dy=0).
+    """
+    if '_' not in piece_label:
+        return 0.0
+    variety = piece_label.split('_')[-1]
+    dx = abs(end[0] - begin[0])
+    dy = abs(end[1] - begin[1])
 
-    removed = list(prev_cells - curr_cells)
-    added = list(curr_cells - prev_cells)
-    changed = [c for c in (prev_cells & curr_cells) if prev_map.get(c) != curr_map.get(c)]
+    if dx == 0 and dy == 0:
+        return float('-inf')
 
-    if not removed:
+    if variety == 'ma':
+        return 10.0 if (dx == 1 and dy == 2) or (dx == 2 and dy == 1) else -5.0
+    if variety == 'xiang':
+        return 10.0 if dx == 2 and dy == 2 else -5.0
+    if variety == 'shi':
+        return 10.0 if dx == 1 and dy == 1 else -5.0
+    if variety in ('jiang', 'shuai'):
+        return 10.0 if dx + dy == 1 else -5.0
+    if variety in ('ju', 'pao'):
+        return 10.0 if (dx == 0 or dy == 0) else -5.0
+    if variety in ('bing', 'zu'):
+        # Kiểm tra lỏng (không biết chiều đi vì không có color context ở đây)
+        return 5.0 if dx + dy <= 2 else -3.0
+    return 3.0  # Loại quân không rõ
+
+
+def infer_move_from_states(prev_map: dict, curr_map: dict):
+    """
+    So sánh 2 trạng thái bàn cờ để suy ra nước đi.
+    Đánh giá tất cả cặp (nguồn × đích) bằng _score_move_candidate(),
+    chọn cặp điểm cao nhất — tránh lấy bừa removed[0]/added[0] như code cũ.
+
+    Xử lý được:
+      - Nước đi thường (ô nguồn mất quân, ô đích mọc quân mới)
+      - Nước ăn quân (ô nguồn mất quân, ô đích đổi sang loại quân mới)
+      - Nhiễu detection (nhiều ô thay đổi cùng lúc)
+    """
+    vacated = [k for k in prev_map if k not in curr_map]
+    occupied = [k for k in curr_map if k not in prev_map]
+    changed = [k for k in prev_map if k in curr_map and prev_map[k] != curr_map[k]]
+
+    if not vacated:
         return None, None, None
 
-    begin = removed[0]
-    end = None
-
-    if added:
-        end = added[0]
-    elif changed:
-        end = changed[0]
-    else:
+    # Sanity check: nếu quá nhiều ô biến mất cùng lúc thì không phải nước đi thật
+    # mà là lỗi calibration grid hoặc nhiễu YOLO toàn bộ frame.
+    if len(vacated) > 2:
         return None, None, None
 
-    piece_label = prev_map.get(begin, 'grid')
-    if piece_label == 'grid':
-        piece_label = curr_map.get(end, 'grid')
+    dst_candidates = occupied + changed
+    if not dst_candidates:
+        return None, None, None
 
-    return begin, end, piece_label
+    best_begin, best_end, best_label = None, None, None
+    best_score = float('-inf')
+
+    for begin in vacated:
+        piece_label = prev_map[begin]
+        for end in dst_candidates:
+            move_score = _score_move_candidate(piece_label, begin, end)
+            # Phạt khoảng cách Manhattan lớn (ưu tiên nước đi gần hơn để giảm nhiễu)
+            dist_penalty = (abs(end[0] - begin[0]) + abs(end[1] - begin[1])) * 0.15
+            total = move_score - dist_penalty
+            if total > best_score:
+                best_score = total
+                best_begin, best_end, best_label = begin, end, piece_label
+
+    # Score âm nghĩa quân cờ không thể đi đến đích theo luật → bỏ qua.
+    if best_score < 0:
+        return None, None, None
+
+    return best_begin, best_end, best_label
 
 def PiecesChangeDetection(current_step):
     global legal_move
     previous_step = cv2.imread('./Test_Image/Step %d.png' % step)
     x, y, w, h = changeDetection(previous_step, current_step, False)
-    # Keep only very tiny/noisy changes; edge moves should still be considered.
-    if w * h < 30*30:
+    if w * h < 30 * 30:
         return 0
 
     prev_map = dict(board_state_map)
-    curr_map = detect_board_map(current_step)
+
+    # Luôn dùng fresh detection thay vì voter để tránh false positive do lệch
+    # calibration giữa init frame và frame hiện tại.
+    curr_map, curr_conf_map = detect_board_map(current_step, prev_map=prev_map, return_conf=True)
+
     begin, end, predict_category = infer_move_from_states(prev_map, curr_map)
     if begin is None or end is None:
         return 0
 
+    # Dùng nhãn quân từ ô nguồn trong trạng thái cũ (đáng tin hơn).
+    rule_piece_label = prev_map.get(begin, 'grid')
+    if rule_piece_label == 'grid':
+        rule_piece_label = predict_category
+
+    piece_name = dic.get(rule_piece_label, 'Unknown piece')
+    move_conf = float(curr_conf_map.get(end, 0.0))
+
+    # Kiểm tra hợp lệ TRƯỚC khi cập nhật trạng thái bàn cờ.
+    legal_move = is_legal_move(begin, end, rule_piece_label) if ENFORCE_MOVE_RULES else True
+
+    # Cập nhật board state để theo dõi vị trí thực tế trên bàn cờ vật lý.
     board_state_map.clear()
     board_state_map.update(curr_map)
+    board_voter.clear()
 
-    piece_name = dic.get(predict_category, 'Unknown piece')
-    print('{} moved from point {} to point {}'.format(piece_name, begin, end))
+    print('{} moved from {} to {} (conf={:.3f}, legal={})'.format(
+        piece_name, begin, end, move_conf, legal_move
+    ))
 
-    legal_move = is_legal_move(begin, end, predict_category) if ENFORCE_MOVE_RULES else True
     if legal_move:
         cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
         save_move_snapshot(current_step, step, piece_name, begin, end, legal=True)
-        return 1
+        return 1  # Hợp lệ → main loop flips isRed, tăng step
 
-    print('Illegal move detected – skip rollback (debug mode), advance frame.')
-    cv2.imwrite('./Test_Image/Step %d.png' % (step + 1), current_step)
+    # Bất hợp lệ: lưu ảnh bàn cờ hiện tại (board đã thay đổi thật) để tránh
+    # lặp phát hiện cùng nước đi bất hợp lệ ở frame tiếp theo.
+    cv2.imwrite('./Test_Image/Step %d.png' % step, current_step)
     save_move_snapshot(current_step, step, piece_name, begin, end, legal=False)
     legal_move = True
-    return 1
+    return 0  # Trả 0 → main loop KHÔNG tăng step, KHÔNG flip isRed
 
 # if __name__ == '__main__':
 # 	# Initialize camera
@@ -693,7 +878,7 @@ def PiecesChangeDetection(current_step):
 if __name__ == '__main__':
     # cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     # cap = cv2.VideoCapture('./Sources/test.avi')
-    cap = cv2.VideoCapture('./Sources/test6.mp4')
+    cap = cv2.VideoCapture('./Sources/test9.mp4')
 
     if not cap.isOpened():
         exit('Camera is not open.')
@@ -703,6 +888,7 @@ if __name__ == '__main__':
         source_fps = 30.0
     STEP0_STABLE_FRAMES_REQUIRED = max(8, int(source_fps * STEP0_STABLE_SECONDS_REQUIRED))
     STABLE_FRAMES_REQUIRED = max(4, int(source_fps * STABLE_SECONDS_REQUIRED))
+    MOVE_DEBOUNCE_FRAMES = max(3, int(source_fps * 0.25))
     frame_wait_ms = max(1, int(1000.0 / source_fps))
 
     print("Camera mở rồi.")
@@ -823,6 +1009,7 @@ if __name__ == '__main__':
     stable_count = 0
     motion_active = False
     frame_index = 0
+    detect_cooldown = 0
 
     Initialization()
 
@@ -843,34 +1030,64 @@ if __name__ == '__main__':
         frame_delta = cv2.absdiff(gray, prev_gray)
         motion_score = cv2.countNonZero(cv2.threshold(frame_delta, MOTION_BINARY_THRESHOLD, 255, cv2.THRESH_BINARY)[1])
 
+        if detect_cooldown > 0:
+            detect_cooldown -= 1
+
+        # --- Nhận kết quả từ background detection thread (non-blocking) ---
+        try:
+            num = _detect_result_q.get_nowait()
+            if num == 1:
+                step += 1
+                isRed = bool(1 - isRed)
+                detect_cooldown = MOVE_DEBOUNCE_FRAMES
+        except _q.Empty:
+            pass
+
+        # --- Motion / stability tracking ---
         if motion_score < STABLE_DIFF_THRESHOLD:
             stable_count += 1
         else:
             motion_active = True
             stable_count = 0
+            board_voter.clear()
 
-        # Trigger detection when movement has happened and scene becomes stable again.
-        if motion_active and stable_count >= STABLE_FRAMES_REQUIRED:
-            num = PiecesChangeDetection(current_frame)
-            if num == 1:
-                step += 1
-                isRed = bool(1 - isRed)
+        # --- Trigger detection async khi đủ điều kiện ---
+        with _detect_lock:
+            can_detect = not _detect_active
+
+        if detect_cooldown == 0 and motion_active and stable_count >= STABLE_FRAMES_REQUIRED and can_detect:
+            with _detect_lock:
+                _detect_active = True
+            frame_copy = current_frame.copy()
+            threading.Thread(
+                target=_detection_worker, args=(frame_copy,), daemon=True
+            ).start()
             motion_active = False
             stable_count = 0
 
-        # Fast-move fallback: periodically try detection while motion is ongoing.
-        if motion_active and frame_index % DETECT_DURING_MOTION_EVERY == 0:
-            num = PiecesChangeDetection(current_frame)
-            if num == 1:
-                step += 1
-                isRed = bool(1 - isRed)
-                motion_active = False
-                stable_count = 0
+        # Fast-move fallback: kích hoạt async detection khi đang chuyển động.
+        if ENABLE_DETECT_DURING_MOTION and detect_cooldown == 0 and motion_active \
+                and frame_index % DETECT_DURING_MOTION_EVERY == 0 and can_detect:
+            with _detect_lock:
+                _detect_active = True
+            frame_copy = current_frame.copy()
+            threading.Thread(
+                target=_detection_worker, args=(frame_copy,), daemon=True
+            ).start()
+            motion_active = False
+            stable_count = 0
 
         previous_frame = current_frame.copy()
         prev_gray = gray
 
-        cv2.imshow('Chinese Chess Tracker', current_frame)
+        # Hiển thị thông tin trạng thái lên màn hình
+        display = current_frame.copy()
+        status_text = 'MOVING' if motion_active else f'STABLE {stable_count}/{STABLE_FRAMES_REQUIRED}'
+        turn_text = 'Red' if isRed else 'Black'
+        color = (0, 0, 255) if motion_active else (0, 255, 0)
+        cv2.putText(display, f'Step {step} | {turn_text} | {status_text}',
+                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        cv2.imshow('Chinese Chess Tracker', display)
         key = cv2.waitKey(frame_wait_ms) & 0xFF
         if key == ord('q'):
             break
