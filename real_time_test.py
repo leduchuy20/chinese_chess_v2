@@ -878,7 +878,7 @@ def PiecesChangeDetection(current_step):
 if __name__ == '__main__':
     # cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     # cap = cv2.VideoCapture('./Sources/test.avi')
-    cap = cv2.VideoCapture('./Sources/test11.mp4')
+    cap = cv2.VideoCapture('./Sources/test10.mp4')
 
     if not cap.isOpened():
         exit('Camera is not open.')
