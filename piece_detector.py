@@ -257,3 +257,4 @@ class PieceDetector:
         label_map = {k: v[0] for k, v in board.items()}
         conf_map = {k: v[1] for k, v in board.items()}
         return label_map, conf_map
+
