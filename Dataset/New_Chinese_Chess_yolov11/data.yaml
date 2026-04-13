@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 16
+names: ['Black-Cannon', 'Black-Chariot', 'Black-Elephant', 'Black-General', 'Black-Guard', 'Black-Horse', 'Black-Soldier', 'None', 'Red-Cannon', 'Red-Chariot', 'Red-Elephant', 'Red-General', 'Red-Guard', 'Red-Horse', 'Red-Soldier', 'intersection']
+
+roboflow:
+  workspace: detect-rhm8j
+  project: detect-rhm8j
+  version: dataset
+  license: Private
+  url: https://app.roboflow.com/detect-rhm8j/detect-rhm8j/dataset
